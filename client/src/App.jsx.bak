@@ -1,0 +1,460 @@
+import { useState, useRef, useEffect, useCallback } from "react";
+
+// ── Inline API call to Claude (for the demo artifact) ───────
+async function callBackend(question, history) {
+  const schema = `
+Table: employees ( id INT PK, first_name VARCHAR, last_name VARCHAR, email VARCHAR, department VARCHAR, job_title VARCHAR, salary DECIMAL, hire_date DATE, is_active TINYINT )
+Table: departments ( id INT PK, name VARCHAR, budget DECIMAL, manager_id INT, location VARCHAR )
+Table: products ( id INT PK, name VARCHAR, category VARCHAR, price DECIMAL, stock_qty INT, supplier VARCHAR, is_available TINYINT )
+Table: orders ( id INT PK, customer_id INT, product_id INT, quantity INT, total_price DECIMAL, status ENUM, order_date DATETIME )
+Table: customers ( id INT PK, full_name VARCHAR, email VARCHAR, city VARCHAR, country VARCHAR, joined_at TIMESTAMP )
+  `;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 512,
+      system: `You are an expert MySQL 9.1 query generator. Given a natural-language question, produce ONLY a valid executable MySQL SELECT statement. No markdown, no backticks, no explanations. Use only these tables:
+${schema}
+If the question cannot be answered, output: UNSUPPORTED_QUERY`,
+      messages: [
+        ...history.slice(-6),
+        { role: "user", content: question }
+      ]
+    }),
+  });
+  const data = await res.json();
+  return data.content?.[0]?.text?.trim() ?? "UNSUPPORTED_QUERY";
+}
+
+// ── Mock result execution ─────────────────────────────────────
+function mockExecute(sql) {
+  const upper = sql.toUpperCase();
+  if (upper.includes("EMPLOYEES")) {
+    return {
+      columns: ["id","first_name","last_name","department","job_title","salary"],
+      rows: [
+        [1,"Alice","Johnson","Engineering","Senior Software Engineer","120000.00"],
+        [3,"Carol","White","Marketing","Marketing Manager","88000.00"],
+        [12,"Leo","Jackson","Finance","CFO","210000.00"],
+        [13,"Mia","Harris","Engineering","Data Scientist","130000.00"],
+      ]
+    };
+  }
+  if (upper.includes("PRODUCTS")) {
+    return {
+      columns: ["id","name","category","price","stock_qty"],
+      rows: [
+        [1,"Laptop Pro 15\"","Electronics","1299.99","45"],
+        [4,"Standing Desk","Furniture","699.99","15"],
+        [5,"4K Monitor 27\"","Electronics","499.99","60"],
+      ]
+    };
+  }
+  if (upper.includes("ORDER")) {
+    return {
+      columns: ["id","customer_id","product_id","total_price","status","order_date"],
+      rows: [
+        [1,1,1,"1299.99","delivered","2024-01-15"],
+        [2,2,5,"999.98","delivered","2024-01-18"],
+        [7,7,4,"699.99","pending","2024-04-05"],
+      ]
+    };
+  }
+  return {
+    columns: ["result"],
+    rows: [["Query executed — connect to MySQL for live results"]]
+  };
+}
+
+const SUGGESTIONS = [
+  "Show all employees earning more than $100k",
+  "Which department has the highest budget?",
+  "List the top 5 most expensive products",
+  "Count orders by status",
+  "Show customers from the US",
+  "What is the average salary per department?",
+];
+
+// ── Status badge ──────────────────────────────────────────────
+function StatusBadge({ status }) {
+  const map = {
+    delivered:  "#10b981",
+    shipped:    "#3b82f6",
+    processing: "#f59e0b",
+    pending:    "#8b5cf6",
+    cancelled:  "#ef4444",
+  };
+  const color = map[status?.toLowerCase()] ?? "#6b7280";
+  return (
+    <span style={{
+      display:"inline-block", padding:"2px 8px", borderRadius:4,
+      background:`${color}22`, color, fontSize:11, fontWeight:600,
+      letterSpacing:"0.5px", textTransform:"uppercase", border:`1px solid ${color}44`
+    }}>
+      {status}
+    </span>
+  );
+}
+
+// ── SQL highlight (very simple) ───────────────────────────────
+function SQLDisplay({ sql }) {
+  const keywords = ["SELECT","FROM","WHERE","JOIN","ON","GROUP BY","ORDER BY","LIMIT","AND","OR","AS","INNER","LEFT","RIGHT","HAVING","DISTINCT","COUNT","SUM","AVG","MAX","MIN","IN","NOT","NULL","BY","DESC","ASC"];
+  const parts = sql.split(/(\s+|,|\(|\))/g);
+  return (
+    <pre style={{
+      margin:0, padding:"16px 20px", background:"#0d1117",
+      borderRadius:8, overflowX:"auto", fontSize:13.5,
+      lineHeight:1.7, fontFamily:"'Fira Code', 'Cascadia Code', monospace",
+      border:"1px solid #21262d", color:"#c9d1d9"
+    }}>
+      {parts.map((p, i) => {
+        const up = p.trim().toUpperCase();
+        if (keywords.includes(up)) return <span key={i} style={{color:"#ff7b72",fontWeight:600}}>{p}</span>;
+        if (/^\d+(\.\d+)?$/.test(p.trim())) return <span key={i} style={{color:"#79c0ff"}}>{p}</span>;
+        if (/^'[^']*'$/.test(p.trim())) return <span key={i} style={{color:"#a5d6ff"}}>{p}</span>;
+        return <span key={i}>{p}</span>;
+      })}
+    </pre>
+  );
+}
+
+export default function App() {
+  const [question,  setQuestion]  = useState("");
+  const [loading,   setLoading]   = useState(false);
+  const [result,    setResult]    = useState(null);
+  const [error,     setError]     = useState(null);
+  const [history,   setHistory]   = useState([]);
+  const [convHist,  setConvHist]  = useState([]);
+  const [activeTab, setActiveTab] = useState("results");
+  const inputRef = useRef(null);
+
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const handleSubmit = useCallback(async (q) => {
+    const text = (q ?? question).trim();
+    if (!text || loading) return;
+    setLoading(true);
+    setError(null);
+    setResult(null);
+
+    try {
+      const sql = await callBackend(text, convHist);
+
+      if (sql === "UNSUPPORTED_QUERY") {
+        setError("This question couldn't be translated to SQL. Try rephrasing it.");
+        setLoading(false);
+        return;
+      }
+
+      const mockResult = mockExecute(sql);
+      const entry = { question: text, sql, ...mockResult, ts: Date.now() };
+
+      setResult(entry);
+      setHistory(h => [entry, ...h].slice(0, 20));
+      setConvHist(c => [
+        ...c,
+        { role:"user", content: text },
+        { role:"assistant", content: sql }
+      ].slice(-12));
+      setActiveTab("results");
+    } catch (e) {
+      setError(e.message ?? "Something went wrong. Check your API key.");
+    }
+    setLoading(false);
+    if (!q) setQuestion("");
+  }, [question, loading, convHist]);
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
+  };
+
+  return (
+    <div style={{
+      minHeight:"100vh", background:"#0a0c10",
+      fontFamily:"'DM Sans','Inter',sans-serif", color:"#e6edf3",
+      display:"flex", flexDirection:"column"
+    }}>
+      {/* ── TOP NAV ── */}
+      <nav style={{
+        padding:"0 32px", height:56, display:"flex", alignItems:"center",
+        justifyContent:"space-between", background:"#0d1117",
+        borderBottom:"1px solid #21262d", position:"sticky", top:0, zIndex:10
+      }}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div style={{
+            width:28, height:28, borderRadius:6, display:"flex",
+            alignItems:"center", justifyContent:"center",
+            background:"linear-gradient(135deg,#58a6ff,#bc8cff)"
+          }}>
+            <svg width="16" height="16" fill="none" viewBox="0 0 24 24">
+              <path d="M4 6h16M4 12h10M4 18h7" stroke="#fff" strokeWidth="2.2" strokeLinecap="round"/>
+            </svg>
+          </div>
+          <span style={{fontWeight:700, fontSize:16, letterSpacing:"-0.3px"}}>
+            txt<span style={{color:"#58a6ff"}}>2</span>sql
+          </span>
+          <span style={{
+            marginLeft:6, fontSize:10, padding:"2px 7px", borderRadius:20,
+            background:"#21262d", color:"#8b949e", fontWeight:500,
+            border:"1px solid #30363d", letterSpacing:"0.5px"
+          }}>POWERED BY CLAUDE</span>
+        </div>
+        <div style={{display:"flex", gap:20, fontSize:13, color:"#8b949e"}}>
+          {["Schema","History","GitHub"].map(t => (
+            <button key={t} onClick={() => setActiveTab(t.toLowerCase())}
+              style={{
+                background:"none", border:"none", color: activeTab===t.toLowerCase() ? "#58a6ff":"#8b949e",
+                cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:500, padding:"4px 0"
+              }}>{t}</button>
+          ))}
+        </div>
+      </nav>
+
+      <main style={{flex:1, maxWidth:900, width:"100%", margin:"0 auto", padding:"40px 24px"}}>
+        {/* ── HERO ── */}
+        <div style={{textAlign:"center", marginBottom:40}}>
+          <h1 style={{
+            fontSize:"clamp(28px,5vw,48px)", fontWeight:800,
+            letterSpacing:"-1.5px", margin:"0 0 12px",
+            background:"linear-gradient(135deg,#e6edf3 30%,#58a6ff)",
+            WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent"
+          }}>
+            Ask anything about your data
+          </h1>
+          <p style={{color:"#8b949e", fontSize:16, margin:0}}>
+            Natural language → MySQL 9.1 query, instantly.
+          </p>
+        </div>
+
+        {/* ── INPUT ── */}
+        <div style={{
+          background:"#161b22", border:`1px solid ${loading ? "#58a6ff66":"#30363d"}`,
+          borderRadius:12, padding:"4px 4px 4px 16px",
+          display:"flex", alignItems:"center", gap:8,
+          transition:"border-color .2s", boxShadow: loading ? "0 0 0 3px #58a6ff18":"none"
+        }}>
+          <textarea
+            ref={inputRef}
+            rows={2}
+            value={question}
+            onChange={e => setQuestion(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="e.g. Show me all employees in Engineering earning over $100k…"
+            style={{
+              flex:1, background:"none", border:"none", outline:"none",
+              color:"#e6edf3", fontFamily:"inherit", fontSize:15,
+              resize:"none", lineHeight:1.5, padding:"10px 0"
+            }}
+          />
+          <button
+            onClick={() => handleSubmit()}
+            disabled={loading || !question.trim()}
+            style={{
+              minWidth:44, height:44, borderRadius:8, border:"none",
+              background: loading||!question.trim() ? "#21262d":"linear-gradient(135deg,#58a6ff,#bc8cff)",
+              color: loading||!question.trim() ? "#484f58":"#fff",
+              cursor: loading||!question.trim() ? "not-allowed":"pointer",
+              display:"flex", alignItems:"center", justifyContent:"center",
+              transition:"all .2s", flexShrink:0
+            }}
+          >
+            {loading
+              ? <div style={{width:18,height:18,border:"2px solid #484f58",borderTop:"2px solid #58a6ff",borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>
+              : <svg width="18" height="18" fill="none" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2L15 22l-4-9-9-4 20-7z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            }
+          </button>
+        </div>
+
+        {/* ── SUGGESTIONS ── */}
+        <div style={{display:"flex", flexWrap:"wrap", gap:8, marginTop:14}}>
+          {SUGGESTIONS.map(s => (
+            <button key={s} onClick={() => { setQuestion(s); setTimeout(()=>handleSubmit(s),50); }}
+              style={{
+                background:"#161b22", border:"1px solid #30363d", borderRadius:20,
+                padding:"6px 14px", color:"#8b949e", fontSize:12.5, cursor:"pointer",
+                fontFamily:"inherit", transition:"all .15s"
+              }}
+              onMouseEnter={e=>{e.target.style.borderColor="#58a6ff";e.target.style.color="#e6edf3";}}
+              onMouseLeave={e=>{e.target.style.borderColor="#30363d";e.target.style.color="#8b949e";}}
+            >{s}</button>
+          ))}
+        </div>
+
+        {/* ── ERROR ── */}
+        {error && (
+          <div style={{
+            marginTop:24, padding:"14px 18px", borderRadius:8,
+            background:"#ff7b7222", border:"1px solid #ff7b7244", color:"#ff7b72",
+            display:"flex", alignItems:"center", gap:10, fontSize:14
+          }}>
+            <svg width="16" height="16" fill="none" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2"/><path d="M12 8v4M12 16h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
+            {error}
+          </div>
+        )}
+
+        {/* ── TABS ── */}
+        <div style={{display:"flex", gap:2, marginTop:28, borderBottom:"1px solid #21262d", paddingBottom:0}}>
+          {["results","schema","history"].map(t => (
+            <button key={t} onClick={() => setActiveTab(t)}
+              style={{
+                background:"none", border:"none", padding:"8px 18px 10px",
+                borderBottom: activeTab===t ? "2px solid #58a6ff":"2px solid transparent",
+                color: activeTab===t ? "#58a6ff":"#8b949e",
+                cursor:"pointer", fontFamily:"inherit", fontSize:13.5,
+                fontWeight:500, textTransform:"capitalize", transition:"color .15s"
+              }}
+            >{t}</button>
+          ))}
+        </div>
+
+        {/* ── RESULTS TAB ── */}
+        {activeTab === "results" && result && (
+          <div style={{marginTop:24}}>
+            <div style={{
+              padding:"12px 16px", background:"#161b22",
+              borderRadius:"8px 8px 0 0", border:"1px solid #30363d",
+              borderBottom:"none", display:"flex", alignItems:"center", justifyContent:"space-between"
+            }}>
+              <span style={{fontSize:12, color:"#8b949e", fontFamily:"monospace"}}>
+                Generated SQL
+              </span>
+              <span style={{fontSize:12, color:"#3fb950"}}>
+                ✓ {result.rows.length} row{result.rows.length !== 1 ? "s":""} returned
+              </span>
+            </div>
+            <SQLDisplay sql={result.sql} />
+
+            {/* Results table */}
+            <div style={{marginTop:16, overflowX:"auto"}}>
+              <table style={{width:"100%", borderCollapse:"collapse", fontSize:13.5}}>
+                <thead>
+                  <tr style={{background:"#161b22"}}>
+                    {result.columns.map(c => (
+                      <th key={c} style={{
+                        padding:"10px 14px", textAlign:"left", color:"#8b949e",
+                        fontWeight:600, fontSize:11, textTransform:"uppercase",
+                        letterSpacing:"0.8px", border:"1px solid #21262d",
+                        whiteSpace:"nowrap"
+                      }}>{c}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.rows.map((row, ri) => (
+                    <tr key={ri} style={{background: ri%2===0 ? "#0d1117":"#0a0c10"}}>
+                      {row.map((cell, ci) => (
+                        <td key={ci} style={{
+                          padding:"10px 14px", border:"1px solid #21262d",
+                          color:"#c9d1d9", whiteSpace:"nowrap"
+                        }}>
+                          {result.columns[ci] === "status" ? <StatusBadge status={cell}/> :
+                           /^\d+\.\d{2}$/.test(String(cell)) ? <span style={{color:"#3fb950",fontFamily:"monospace"}}>${cell}</span> :
+                           String(cell)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ── SCHEMA TAB ── */}
+        {activeTab === "schema" && (
+          <div style={{marginTop:24, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))", gap:12}}>
+            {[
+              {name:"employees", cols:["id","first_name","last_name","email","department","job_title","salary","hire_date"]},
+              {name:"departments", cols:["id","name","budget","manager_id","location"]},
+              {name:"products", cols:["id","name","category","price","stock_qty","supplier"]},
+              {name:"orders", cols:["id","customer_id","product_id","quantity","total_price","status","order_date"]},
+              {name:"customers", cols:["id","full_name","email","city","country","joined_at"]},
+            ].map(t => (
+              <div key={t.name} style={{
+                background:"#161b22", border:"1px solid #30363d", borderRadius:8, padding:16
+              }}>
+                <div style={{
+                  display:"flex", alignItems:"center", gap:8, marginBottom:12,
+                  paddingBottom:10, borderBottom:"1px solid #21262d"
+                }}>
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="5" rx="1" stroke="#58a6ff" strokeWidth="2"/><rect x="3" y="10" width="18" height="5" rx="1" stroke="#58a6ff" strokeWidth="2"/><rect x="3" y="17" width="18" height="4" rx="1" stroke="#58a6ff" strokeWidth="2"/></svg>
+                  <span style={{color:"#e6edf3", fontWeight:600, fontSize:14}}>{t.name}</span>
+                </div>
+                {t.cols.map(c => (
+                  <div key={c} style={{
+                    display:"flex", alignItems:"center", gap:6,
+                    padding:"3px 0", fontSize:12.5
+                  }}>
+                    {c === "id" && <span style={{color:"#f0883e", fontSize:10}}>PK</span>}
+                    {c.endsWith("_id") && c !== "id" && <span style={{color:"#8b949e", fontSize:10}}>FK</span>}
+                    {c !== "id" && !c.endsWith("_id") && <span style={{width:20}}/>}
+                    <span style={{color:"#c9d1d9", fontFamily:"monospace"}}>{c}</span>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ── HISTORY TAB ── */}
+        {activeTab === "history" && (
+          <div style={{marginTop:24}}>
+            {history.length === 0
+              ? <p style={{color:"#484f58", textAlign:"center", marginTop:40}}>No queries yet.</p>
+              : history.map((h, i) => (
+                <div key={i} onClick={() => { setQuestion(h.question); setResult(h); setActiveTab("results"); }}
+                  style={{
+                    background:"#161b22", border:"1px solid #30363d", borderRadius:8,
+                    padding:"14px 16px", marginBottom:8, cursor:"pointer",
+                    transition:"border-color .15s"
+                  }}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor="#58a6ff"}
+                  onMouseLeave={e=>e.currentTarget.style.borderColor="#30363d"}
+                >
+                  <div style={{display:"flex", justifyContent:"space-between", alignItems:"flex-start"}}>
+                    <span style={{fontSize:14, color:"#e6edf3", fontWeight:500}}>{h.question}</span>
+                    <span style={{fontSize:11, color:"#484f58", flexShrink:0, marginLeft:16}}>
+                      {new Date(h.ts).toLocaleTimeString()}
+                    </span>
+                  </div>
+                  <div style={{
+                    marginTop:8, fontSize:12, fontFamily:"monospace",
+                    color:"#58a6ff", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"
+                  }}>
+                    {h.sql}
+                  </div>
+                  <span style={{fontSize:11, color:"#3fb950", marginTop:4, display:"block"}}>
+                    {h.rows?.length ?? 0} rows
+                  </span>
+                </div>
+              ))
+            }
+          </div>
+        )}
+
+        {/* ── EMPTY RESULTS ── */}
+        {activeTab === "results" && !result && !error && (
+          <div style={{textAlign:"center", padding:"60px 0", color:"#484f58"}}>
+            <svg width="48" height="48" fill="none" viewBox="0 0 24 24" style={{margin:"0 auto 16px", display:"block"}}>
+              <path d="M4 6h16M4 12h10M4 18h7" stroke="#30363d" strokeWidth="1.5" strokeLinecap="round"/>
+              <circle cx="17" cy="17" r="4" stroke="#30363d" strokeWidth="1.5"/>
+              <path d="M20 20l2 2" stroke="#30363d" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p style={{margin:0, fontSize:14}}>Ask a question to generate a query</p>
+          </div>
+        )}
+      </main>
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        * { box-sizing: border-box; }
+        ::-webkit-scrollbar { width:6px; height:6px; }
+        ::-webkit-scrollbar-track { background:#0d1117; }
+        ::-webkit-scrollbar-thumb { background:#30363d; border-radius:3px; }
+      `}</style>
+    </div>
+  );
+}
